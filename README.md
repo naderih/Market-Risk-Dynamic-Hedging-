@@ -1,70 +1,72 @@
 # Market Risk Dynamic Hedging & Stress Testing Framework (PoC)
 
 ## 1. Executive Summary
-This repository serves as a **Proof of Concept (PoC)** for a modernized Market Risk stress testing framework. Unlike traditional VaR models that often rely on instantaneous shocks, this framework simulates **Path-Dependent Risks** over a multi-day horizon.
+This repository serves as a **Proof of Concept (PoC)** for a modernized Market Risk stress testing framework. It moves beyond static "instantaneous shock" models (like standard VaR) to capture **Path-Dependent Risks** and **Liquidity Feedback Loops**.
 
-The core objective is to quantify the **"Cost of Survival"**—the losses incurred from re-hedging a portfolio during a liquidity crisis, driven by widening bid-ask spreads, volatility spikes, and funding squeezes.
+The core objective is to quantify the **"Cost of Survival"**—the realized P&L erosion caused by re-hedging a portfolio during a market crisis, driven by widening bid-ask spreads, volatility spikes, and funding squeezes.
 
-## 2. Technical Methodology & Nuances
+## 2. Key Financial Concepts Modeled
 
-### A. The Feedback Loop (Volatility & Liquidity)
-Standard stress tests often shock Spot and Volatility independently. This framework models the **endogenous relationship** between them:
-*   **Inverse Correlation:** As Spot prices drop, Volatility is programmed to spike (the "Leverage Effect").
-*   **Liquidity Haircuts:** Transaction costs are not static. The engine dynamically widens the Bid-Ask Spread proportional to the volatility spike:
-    `Spread_Current = Spread_Base * (Vol_Current / Vol_Base)`
+### A. The Volatility-Liquidity Feedback Loop
+Standard stress tests often shock Spot and Volatility independently. This engine models the endogenous relationship between them:
+*   **Inverse Correlation:** As Spot prices drop, Volatility is programmed to spike.
+*   **Dynamic Spreads:** Transaction costs are not static. The engine calculates a "Liquidity Haircut," widening the Bid-Ask Spread proportionally to the volatility spike.
 
-### B. Multi-Curve Dynamics
-To accurately price Swaps and Options under stress, the `MarketEnvironment` explicitly separates the yield curve into three components:
-1.  **Overnight (SOFR):** Drives the Floating Leg of swaps and Option Discounting.
-2.  **Short Rate (2Y):** Drives the front-end of the curve expectation.
-3.  **Long Rate (10Y):** Drives the long-end (Duration/Inflation).
+### B. Maturity Bucketing & Curve Risk
+The framework treats time-to-maturity as a dynamic variable attached to each instrument, allowing for the testing of **Term Structure** risks:
+*   **Gamma Mismatch:** Captures the risk of hedging long-dated liabilities (Low Gamma) with short-dated assets (High Gamma).
+*   **Vega Convexity:** Demonstrates why "Netting Vega" across different tenors fails during a crash.
 
-This allows for the testing of complex curve shapes, such as **Bear Flatteners** (Fed hikes, long end lags) or **Bear Steepeners** (Term premium blowout).
-
-### C. The Hedging Engine (P&L Attribution)
-The simulation tracks three distinct sources of P&L leakage often missed in static tests:
-1.  **Gamma Bleed:** The loss incurred by "Buying High, Selling Low" to maintain a Delta-Neutral position in a Short Gamma portfolio.
-2.  **Transaction Costs:** The realized cost of crossing the spread during re-balancing.
-3.  **Funding Liquidity Risk:** The simulation accounts for **Credit Spreads**. When the portfolio borrows cash to fund a hedge, it pays `SOFR + CreditSpread`. In a crisis (e.g., Repo Spike), this funding cost explodes, simulating a "Cash Squeeze."
+### C. The Funding Squeeze
+The simulation explicitly tracks the **Cash Balance** required to maintain the hedge.
+*   **Shorting Stock:** Generates cash, earning the Risk-Free Rate (SOFR).
+*   **Borrowing Cash:** If the strategy requires buying assets (e.g., hedging a Short Call), the desk must borrow at `SOFR + Credit Spread`.
+*   **Stress Impact:** In scenarios like the **2019 Repo Crisis**, this reveals how a spike in funding rates can erode P&L even if the Delta hedge is perfect.
 
 ---
 
-## 3. Project Structure
+## 3. Simulation Experiments
+
+The `main.ipynb` notebook runs three specific experiments to stress test common hedging assumptions:
+
+### Experiment 1: The "Gamma Bleed" (Baseline)
+*   **Scenario:** Spot drops 40% over 20 days; Volatility triples.
+*   **Strategy:** Daily Delta-Hedging of a Short 1Y Put.
+*   **Insight:** Even with daily rebalancing, the portfolio suffers significant losses due to **Gamma Bleed** (selling low/buying high) and the accumulation of transaction costs in a widening-spread environment.
+
+### Experiment 2: The "Widowmaker" (Maturity Mismatch)
+*   **Scenario:** Hedging a **5-Year Liability** (Short Put) using **1-Year Assets** (Long Puts).
+*   **Strategy:** Neutralize initial Vega.
+*   **Insight:** To match the high Vega of the 5Y option, the model must buy ~3x the notional in 1Y options. When the crash occurs, the explosive Gamma of the 1Y hedge leads to massive over-hedging and transaction costs, causing losses to **double** compared to a simple Delta hedge. This validates the need for strict **Tenor Bucketing**.
+
+### Experiment 3: Hedging Frequency (Daily vs. Weekly)
+*   **Scenario:** Comparing re-hedging intervals during a monotonic crash.
+*   **Insight:** Counter-intuitively, **Weekly** hedging incurred *higher* transaction costs than Daily hedging in this specific scenario. By waiting 5 days to re-hedge, the model was forced to execute massive block trades exactly when volatility (and spreads) had peaked. This highlights the **Liquidity Feedback Loop**—lazy hedging can be expensive if you are forced to trade into a panic.
+
+---
+
+## 4. Project Structure
 
 ```text
 market-risk-dynamic-hedging/
 │
-├── main.ipynb            # The Presentation Layer. Runs the Taper Tantrum simulation and visualizes P&L.
+├── main.ipynb            # The Dashboard. Runs the simulations and visualizes P&L/Greeks.
 │
 └── src/
-    ├── market_env.py     # Scenario Generator. Contains the "Historical Library" (2013, 2016, 2019, 2020, 2022, 2025) and Custom Engine.
-    ├── instruments.py    # Pricing Models. Implements Black-Scholes for Options and Interpolated Zero-Curves for Swaps.
-    ├── hedging_engine.py # The Logic Core. Simulates the trader's daily re-hedging logic, P&L, and cash management.
+    ├── market_env.py     # Scenario Generator. Creates daily time-series for Spot, Vol, SOFR, and Spreads using pandas Business Dates.
+    ├── instruments.py    # Pricing Engine. Implements Black-Scholes with dynamic time-to-maturity calculation (ACT/365).
+    ├── hedging_engine.py # The Logic Core. Simulates the trader's daily re-hedging logic, Greeks aggregation, and cash management.
 ```
-### 4. Scenario Library
 
-The `MarketEnvironment` class includes presets for historical and hypothetical stress events:
+## 5. Technical Implementation Details
 
-*   **`taper_tantrum_2013`:** A classic **Bear Steepener**. Short rates stay anchored, but Long rates and Term Premia explode. Liquidity spreads widen moderately.
-*   **`repo_crisis_2019`:** A **Plumbing Dislocation**. Overnight SOFR/Repo rates spike aggressively while the rest of the curve lags. Tests the portfolio's sensitivity to funding costs.
-*   **`covid_crash_2020`:** A **Deflationary Bust**. Equities crash, Volatility explodes, and Rates collapse to zero.
-*   **`liberation_day_2025` (Hypothetical):** A **Stagflation/Trade War** scenario. Models a breakdown in correlations where Rates rise (Inflation defense) while Equities fall (Growth shock), combined with a blowout in Credit Spreads.
+*   **Object-Oriented Design:** Instruments are stateless objects that calculate their own risk metrics based on the simulation environment's current date and state.
+*   **Vectorization:** Market scenarios are generated as Pandas DataFrames, allowing for efficient iteration and state tracking.
+*   **Funding Logic:** The engine applies asymmetric interest rates—earning the risk-free rate on positive cash, but paying `RiskFree + CreditSpread` on negative balances.
 
 ---
 
-## 5. Visualizing the Output
+## 6. Future Enhancements for Enterprise Scale
 
-Running `main.ipynb` generates a dashboard with three critical panels:
-
-### Panel 1: Hedged vs. Unhedged P&L
-*   **Red Line (Unhedged):** Shows the catastrophic loss of a "Short Put" position in a crash.
-*   **Blue Line (Hedged):** Shows the mitigated profile. However, the line drifts downward over time. This drift represents the **Gamma Bleed**—the unavoidable cost of hedging curvature in a volatile market.
-
-### Panel 2: Transaction Costs (Liquidity)
-*   **Black Line:** The Bid-Ask spread (in bps). Notice it rises as Volatility increases.
-*   **Orange Bars:** The daily realized transaction cost. This quantifies the "Liquidity Tax" paid to the market to exit risk.
-
-### Panel 3: Funding Costs (Credit Squeeze)
-*   **Purple Bars:** The daily interest paid/earned on the cash account.
-*   **Green Line:** The Credit Spread.
-*   **Interpretation:** In scenarios like the **Repo Crisis**, high Credit Spreads cause a "Funding Drag," significantly eroding returns on levered positions.
+*   **Grid Computing:** For a bank-wide book (thousands of trades), the `get_greeks` loop would be parallelized or replaced with a Taylor Expansion approximation for speed.
+*   **Data Lineage:** Production implementation would require tight integration with the Finance/P&L system to ensure the "Day 0" snapshot matches official books.
