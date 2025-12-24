@@ -42,7 +42,7 @@ class PortfolioManager:
             It sums them all up to tell us the Net Risk of the entire book 
             (e.g., "We are Short 5,000 Delta and Short 2,000 Vega")
         """
-        # starting with a baseline dictionary
+        # starting with a baseline greeks dictionary
         greeks = {'price': 0.0, 'delta': 0.0, 'gamma': 0.0, 'vega': 0.0}
         
         for pos in self.positions:
@@ -67,14 +67,18 @@ class HedgingSimulation:
     def __init__(self, portfolio, market_scenario_df, 
                  gamma_hedge_inst=None, 
                  vega_hedge_inst=None, 
-                 rehedge_interval = 1):
+                 rehedge_interval = 1,
+                 stock_spread_bps = 5.0,   # Base spread for stock
+                 option_spread_bps = 100.0, 
+                 delta_limit = 0.0): # Base spread for options
         
         self.portfolio = portfolio
         self.scenario_df = market_scenario_df
         self.gamma_inst = gamma_hedge_inst
         self.vega_inst = vega_hedge_inst
         self.rehedge_interval = rehedge_interval
-        
+        self.delta_limit = delta_limit
+
         # Simulation State
         
         self.cash = 0.0
@@ -84,8 +88,8 @@ class HedgingSimulation:
         
         # Transaction Cost Parameters
         self.base_vol = market_scenario_df['vol'].iloc[0]
-        self.stock_spread_bps = 5.0      # Base spread for stock
-        self.option_spread_bps = 100.0   # Base spread for options
+        self.stock_spread_bps = stock_spread_bps     
+        self.option_spread_bps = option_spread_bps   
 
 
         # --- PRE-HEDGE LOGIC ---
@@ -132,7 +136,7 @@ class HedgingSimulation:
             # it must be greater than 0
             if abs(unit_vega) > 1e-9:
                 # the position in the vega hedge instrument is determined by our initial position's vega 
-                # and our added vega from gall ahedge 
+                # and our added vega from gamma hedge 
                 self.pos_vega_hedge = -(initial_greeks['vega'] + added_vega_from_gamma_hedge) / unit_vega
 
         # 4. Establish Delta Hedge (The Clean Up)
@@ -242,33 +246,36 @@ class HedgingSimulation:
             cost_spread_vega = 0
             cost_spread_delta = 0
             
-            if step_counter % self.rehedge_interval == 0:
 
-                # 2. Construct Current Portfolio View (Base + Existing Hedges)
-                # initialize a snapshot portfolio (empty now)
-                current_portfolio_view = PortfolioManager()
-            
-                # update the snapshot view by our positions  
-                for p in self.portfolio.positions: 
-                    current_portfolio_view.add_position(p['instrument'], p['qty'])
-            
-                # if we are gamma hedging, add the gamma hedge instruemnt and num of positions to the snapshot
-                if self.pos_gamma_hedge != 0: 
-                    current_portfolio_view.add_position(self.gamma_inst, self.pos_gamma_hedge)
-                # similar for vega 
-                if self.pos_vega_hedge != 0: 
-                    current_portfolio_view.add_position(self.vega_inst, self.pos_vega_hedge)
-            
-                # Get Net Greeks before re-balancing: 
-                # get_greeks goes over every position in the portfolio 
-                # and give us the greek for the whole portfolio
-                port_greeks = current_portfolio_view.get_greeks(S, vol, date, sofr)
+            # 2. Construct Current Portfolio View (Base + Existing Hedges)
+            # initialize a snapshot portfolio (empty now)
+            current_portfolio_view = PortfolioManager()
+        
+            # update the snapshot view by our positions  
+            for p in self.portfolio.positions: 
+                current_portfolio_view.add_position(p['instrument'], p['qty'])
+        
+            # if we are gamma hedging, add the gamma hedge instruemnt and num of positions to the snapshot
+            if self.pos_gamma_hedge != 0: 
+                current_portfolio_view.add_position(self.gamma_inst, self.pos_gamma_hedge)
+            # similar for vega 
+            if self.pos_vega_hedge != 0: 
+                current_portfolio_view.add_position(self.vega_inst, self.pos_vega_hedge)
+        
+            # Get Net Greeks before re-balancing: 
+            # get_greeks goes over every position in the portfolio 
+            # and give us the greek for the whole portfolio
+            port_greeks = current_portfolio_view.get_greeks(S, vol, date, sofr)
+
+            # Calculate Total Net Delta (Derivatives + Stock)
+            current_net_delta = port_greeks['delta'] + self.pos_stock
             
             #----------------------------------------------------------------------------
             # --- TRADING LOGIC CASCADE ---
             # Ok now we have calculated the portfolio greeks. we have the snapshot. 
             # we have the hedge instrument. 
             # we can hedge in order Gamma, Vega, Delta 
+            if step_counter % self.rehedge_interval == 0:
 
             # Step A: Re-Hedge Gamma
                 if self.gamma_inst:
@@ -315,18 +322,24 @@ class HedgingSimulation:
                 # The 'port_greeks' now contains the Delta of the Base Port + Gamma Hedge + Vega Hedge.
                 # We need to adjust our Stock position to neutralize this.
                 # Total Target Stock = -NetDeltaDerivatives
-                target_stock = -port_greeks['delta']
+                current_net_delta = port_greeks['delta'] + self.pos_stock # Total delta including stock
+                if abs(current_net_delta) > self.delta_limit:
+                    # Logic to hedge back to 0
+                    target_stock = -port_greeks['delta']
+                    stock_trade = target_stock - self.pos_stock
                 
-                # The trade is the difference between Target and Current underlying hedge 
-                stock_trade = target_stock - self.pos_stock
+                                   
+                    # let's get the spread cost of the hedge trade 
+                    cost_spread_delta = self._get_spread_cost(stock_trade * S, vol, is_option=False)
+                    # the effect on cash if from our spot trade + the spread costs 
+                    self.cash -= (stock_trade * S) + cost_spread_delta
+                    self.pos_stock = target_stock
                 
-                # let's get the spread cost of the hedge trade 
-                cost_spread_delta = self._get_spread_cost(stock_trade * S, vol, is_option=False)
-                # the effect on cash if from our spot trade + the spread costs 
-                self.cash -= (stock_trade * S) + cost_spread_delta
-                self.pos_stock = target_stock
+                     # Update net delta for reporting
+                    current_net_delta = port_greeks['delta'] + self.pos_stock
 
-            # --- VALUATION & REPORTING (Daily)---
+
+            # --- VALUATION & REPORTING ---
             
             # Value the Base (no hedge) Portfolio
             val_base = PortfolioManager()
@@ -341,9 +354,9 @@ class HedgingSimulation:
             if self.vega_inst: 
                 pv_hedges += self.pos_vega_hedge * self.vega_inst.price(S, date, sofr, vol)
             
-            pv_hedges += self.pos_stock * S
+            pv_stock = self.pos_stock * S
             # Total P&L = Derivatives + Stock + Cash
-            total_pnl = pv_base + pv_hedges + self.cash
+            total_pnl = pv_base + pv_hedges + pv_stock + self.cash
 
             results.append({
                 'date': date,
@@ -353,7 +366,11 @@ class HedgingSimulation:
                 'gamma_hedge_pos': self.pos_gamma_hedge,
                 'vega_hedge_pos': self.pos_vega_hedge,
                 'txn_costs': cost_spread_delta + cost_spread_gamma + cost_spread_vega,
-                'funding_cost': funding
+                'funding_cost': funding,
+                # EXPORT GREEKS
+                'portfolio_delta': current_net_delta,
+                'portfolio_gamma': port_greeks['gamma'],
+                'portfolio_vega': port_greeks['vega']
             })
 
             step_counter +=1 
