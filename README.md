@@ -1,47 +1,50 @@
-# Market Risk Dynamic Hedging & Stress Testing Framework (PoC)
+# Quantitative Risk: Dynamic Hedging & Convexity Analysis
 
 ## 1. Executive Summary
-This repository serves as a **Proof of Concept (PoC)** for a modernized Market Risk stress testing framework. It moves beyond static "instantaneous shock" models (like standard VaR) to capture **Path-Dependent Risks** and **Liquidity Feedback Loops**.
+This repository implements a **Path-Dependent Hedging Simulator** designed to stress-test hedging strategies under extreme liquidity constraints.
 
-The core objective is to quantify the **"Cost of Survival"**—the realized P&L erosion caused by re-hedging a portfolio during a market crisis, driven by widening bid-ask spreads, volatility spikes, and funding squeezes.
+While traditional Risk models often focus on Day-1 Greeks, this framework answers the strategic question: **"What happens to a hedge over time when structural constraints (Maturity Mismatches, Risk Limits, Liquidity Dry-ups) collide with a market crash?"**
 
-## 2. Key Financial Concepts Modeled
-
-### A. The Volatility-Liquidity Feedback Loop
-Standard stress tests often shock Spot and Volatility independently. This engine models the endogenous relationship between them:
-*   **Inverse Correlation:** As Spot prices drop, Volatility is programmed to spike.
-*   **Dynamic Spreads:** Transaction costs are not static. The engine calculates a "Liquidity Haircut," widening the Bid-Ask Spread proportionally to the volatility spike.
-
-### B. Maturity Bucketing & Curve Risk
-The framework treats time-to-maturity as a dynamic variable attached to each instrument, allowing for the testing of **Term Structure** risks:
-*   **Gamma Mismatch:** Captures the risk of hedging long-dated liabilities (Low Gamma) with short-dated assets (High Gamma).
-*   **Vega Convexity:** Demonstrates why "Netting Vega" across different tenors fails during a crash.
-
-### C. The Funding Squeeze
-The simulation explicitly tracks the **Cash Balance** required to maintain the hedge.
-*   **Shorting Stock:** Generates cash, earning the Risk-Free Rate (SOFR).
-*   **Borrowing Cash:** If the strategy requires buying assets (e.g., hedging a Short Call), the desk must borrow at `SOFR + Credit Spread`.
-*   **Stress Impact:** In scenarios like the **2019 Repo Crisis**, this reveals how a spike in funding rates can erode P&L even if the Delta hedge is perfect.
+The core analysis focuses on the **"Convexity Trap"**—the structural failure that occurs when hedging long-dated liabilities with short-dated assets—and the "Luck vs. Skill" attribution of risk limits.
 
 ---
 
-## 3. Simulation Experiments
+## 2. Key Analysis Modules (`main_narrative_intuition.ipynb`)
 
-The `main.ipynb` notebook runs three specific experiments to stress test common hedging assumptions:
+This notebook contains the primary narrative arc, broken down into three targeted experiments:
 
-### Experiment 1: The "Gamma Bleed" (Baseline)
-*   **Scenario:** Spot drops 40% over 20 days; Volatility triples.
-*   **Strategy:** Daily Delta-Hedging of a Short 1Y Put.
-*   **Insight:** Even with daily rebalancing, the portfolio suffers significant losses due to **Gamma Bleed** (selling low/buying high) and the accumulation of transaction costs in a widening-spread environment.
+### Experiment 1: Model Validation (Taylor Expansion)
+* **Objective:** Verify that the simulation engine's P&L attribution matches theoretical pricing models.
+* **Methodology:** Compares the simulated P&L against a second-order Taylor Expansion ($\text{Delta} + \frac{1}{2}\text{Gamma} + \text{Vega}$).
+* **Result:** Confirms the engine accurately captures Greeks, isolating the residual "Cross-Gamma" noise.
 
-### Experiment 2: The "Widowmaker" (Maturity Mismatch)
-*   **Scenario:** Hedging a **5-Year Liability** (Short Put) using **1-Year Assets** (Long Puts).
-*   **Strategy:** Neutralize initial Vega.
-*   **Insight:** To match the high Vega of the 5Y option, the model must buy ~3x the notional in 1Y options. When the crash occurs, the explosive Gamma of the 1Y hedge leads to massive over-hedging and transaction costs, causing losses to **double** compared to a simple Delta hedge. This validates the need for strict **Tenor Bucketing**.
+### Experiment 2: The "Convexity Trap" (Maturity Mismatch)
+* **The Scenario:** A 5-Year Liability (Short Put) hedged with a 1-Year Asset (Long Put).
+* **The Math:** * **Vega:** Scales with $\sqrt{T}$. To neutralize the 5Y Vega, we must buy **~2.2x** the notional in 1Y options.
+    * **Gamma:** Scales with $1/\sqrt{T}$. The 1Y option is inherently more convex ("nervous").
+    * **The Trap:** By leveraging quantity (2.2x) on a high-gamma instrument, we create a massive **Net Gamma Imbalance**.
+* **Outcome:** The simulation proves that while the hedge works on paper (Gross P&L), the **Transaction Costs** (Churn) required to manage the 1Y Gamma creates a loss larger than the unhedged portfolio.
 
-### Experiment 3: Hedging Frequency (Daily vs. Weekly)
-*   **Scenario:** Comparing re-hedging intervals during a monotonic crash.
-*   **Insight:** Counter-intuitively, **Weekly** hedging incurred *higher* transaction costs than Daily hedging in this specific scenario. By waiting 5 days to re-hedge, the model was forced to execute massive block trades exactly when volatility (and spreads) had peaked. This highlights the **Liquidity Feedback Loop**—lazy hedging can be expensive if you are forced to trade into a panic.
+### Experiment 3: Risk Limits (Strict vs. "Lazy" Hedging)
+* **The Question:** "Can we reduce churn by using Risk Limits (only re-hedging when $|\Delta| > \text{Limit}$?)"
+* **The Finding:** * **Transaction Costs:** Savings were negligible (~$150) because the crash severity overwhelmed the limit.
+    * **Net P&L:** Improved by ~$70,000.
+    * **The Insight:** The improvement was **not** due to efficiency. It was **Path Dependent Luck**. By delaying the hedge ("Laziness"), the model effectively carried a short position overnight during a crash. In a V-shaped recovery, this same strategy would have resulted in maximum loss.
+
+---
+
+## 3. Technical Architecture
+
+### A. The Engine (`src/hedging_engine.py`)
+A discrete-event simulator that manages the lifecycle of the portfolio. Key features include:
+* **Delta Thresholding:** Allows for "Lazy Hedging" simulation via the `delta_limit` parameter.
+* **Dynamic Spreads:** Bid-Ask spreads are not static; they widen endogenously based on the Volatility regime (`Spread_Current = Spread_Base * Vol_Ratio`).
+* **Funding Topology:** Separates "Cash Proceeds" (earning SOFR) from "Margin Loans" (paying SOFR + Credit Spread), capturing the cost of liquidity squeezes.
+
+### B. The Market Environment (`src/market_env.py`)
+Generates coherent stress scenarios where Spot, Volatility, and Rates move in correlated feedback loops.
+* **Inverse Correlation:** Spot drops trigger Volatility spikes (Leverage Effect).
+* **Curve Dynamics:** Simulates steepeners/flatteners by shocking Short (2Y) and Long (10Y) rates independently.
 
 ---
 
@@ -50,23 +53,24 @@ The `main.ipynb` notebook runs three specific experiments to stress test common 
 ```text
 market-risk-dynamic-hedging/
 │
-├── main.ipynb            # The Dashboard. Runs the simulations and visualizes P&L/Greeks.
+├── main_narrative_intuition.ipynb  # [NEW] The core analysis: Mismatch, Limits, and Attribution.
+├── main.ipynb                      # Legacy dashboard for general Taper Tantrum scenarios.
 │
 └── src/
-    ├── market_env.py     # Scenario Generator. Creates daily time-series for Spot, Vol, SOFR, and Spreads using pandas Business Dates.
-    ├── instruments.py    # Pricing Engine. Implements Black-Scholes with dynamic time-to-maturity calculation (ACT/365).
-    ├── hedging_engine.py # The Logic Core. Simulates the trader's daily re-hedging logic, Greeks aggregation, and cash management.
+    ├── hedging_engine.py           # The Logic Core: Greeks, Re-balancing, P&L Attribution.
+    ├── instruments.py              # Pricing Models: Black-Scholes and Yield Curve interpolation.
+    ├── market_env.py               # Scenario Generator: Feedback loops and historical calibration.
+
 ```
 
-## 5. Technical Implementation Details
+## 5. Strategic Roadmap (Future Work)
+Based on the findings in this PoC, the following modules are proposed for future development:
 
-*   **Object-Oriented Design:** Instruments are stateless objects that calculate their own risk metrics based on the simulation environment's current date and state.
-*   **Vectorization:** Market scenarios are generated as Pandas DataFrames, allowing for efficient iteration and state tracking.
-*   **Funding Logic:** The engine applies asymmetric interest rates—earning the risk-free rate on positive cash, but paying `RiskFree + CreditSpread` on negative balances.
+**Portfolio Aggregation:** Extending the engine to handle multi-instrument portfolios rather than single-option liabilities.
 
----
+**Expected Shortfall (ES) Optimization:** Replacing mechanical Delta-Hedging with a "Variance vs. Cost" optimizer to mathematically solve the trade-off between tracking error and transaction costs.
 
-## 6. Future Enhancements for Enterprise Scale
+**OTM Hedging Analysis:** Testing the cost-efficiency of Out-of-the-Money put spreads vs. At-the-Money linear hedges.
 
-*   **Grid Computing:** For a bank-wide book (thousands of trades), the `get_greeks` loop would be parallelized or replaced with a Taylor Expansion approximation for speed.
-*   **Data Lineage:** Production implementation would require tight integration with the Finance/P&L system to ensure the "Day 0" snapshot matches official books.
+### 6. Disclaimer
+This project is a quantitative research Proof of Concept. The scenarios and pricing models are simplified for performance and demonstration purposes.
